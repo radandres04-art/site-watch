@@ -1,0 +1,60 @@
+name: watch
+
+on:
+  schedule:
+    # раз в 10 минут, не в начале часа: там у GitHub очередь и запуски опаздывают сильнее
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+    inputs:
+      drill:
+        description: 'Проба: проверить сайт и прислать одно пробное сообщение'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: state
+          path: state
+      - name: check
+        env:
+          WATCH_URL: ${{ secrets.WATCH_URL }}
+          WATCH_NAME: ${{ secrets.WATCH_NAME }}
+          WATCH_MAIN: ${{ secrets.WATCH_MAIN }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          WATCH_DRILL: ${{ inputs.drill && '1' || '' }}
+        run: python3 -I watch.py state/state.json
+      - name: save state
+        if: always()
+        run: |
+          cd state
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -q -m "state"
+            git push -q origin HEAD:state
+          fi
+      - name: keep schedule on
+        # GitHub выключает расписание в папке без движения 60 дней. Раз в неделю включаем его заново.
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%u%H)" = "112" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/watch.yml/enable" --silent || true
+          fi
