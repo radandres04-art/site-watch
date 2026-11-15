@@ -73,7 +73,7 @@ def case_outage():
         step(tmp, '2026-11-15T10:27:00+00:00', 'up')
         m = messages(tmp)
         check('поднялся: зелёное с длительностью', m[-1]['text'].startswith('<b>🟢 Проба: сайт снова открывается</b>')
-              and 'Сбой длился 37 ч 30 мин (13.11 23:57 – 15.11 13:27).' in m[-1]['text'])
+              and 'Запасной сторож: сбой длился 37 ч 30 мин (13.11 23:57 – 15.11 13:27).' in m[-1]['text'])
         check('после отбоя сбой забыт', not {'down_since', 'suspect', 'alerted'} & set(state(tmp)))
         before = len(messages(tmp))
         step(tmp, '2026-11-15T10:37:00+00:00', 'up')
@@ -124,7 +124,7 @@ def case_drill():
         step(tmp, '2026-11-15T11:10:00+00:00', 'down')
         step(tmp, '2026-11-15T11:12:00+00:00', 'down', drill=True)
         m = messages(tmp)
-        check('проба во время настоящего сбоя говорит правду', 'Сайт сейчас НЕ открывается' in m[-1]['text'])
+        check('проба во время настоящего сбоя говорит правду', 'Сейчас сайт не отвечает.' in m[-1]['text'])
         check('и настоящий сбой не сбит', 'down_since' in state(tmp))
         step(tmp, '2026-11-15T11:13:00+00:00', 'up', drill=True, tg_down=True, expect=1)
         check('проба при сломанном Telegram: запуск красный', True)
@@ -138,7 +138,46 @@ def case_flap():
             step(tmp, at, probe)
         m = messages(tmp)
         check('мигание ночью: вторая тревога в течение часа без звука',
-              len(m) == 3 and m[0]['silent'] is False and m[2]['text'].startswith('<b>🔴') and m[2]['silent'] is True)
+              len(m) == 3 and m[0]['silent'] is False and m[2]['silent'] is True
+              and m[2]['text'].startswith('<b>🔴 Проба: сайт снова не открывается</b>'))
+
+
+def case_green_lost_then_down_again():
+    with tempfile.TemporaryDirectory() as tmp:
+        step(tmp, '2026-11-14T10:00:00+00:00', 'down')
+        step(tmp, '2026-11-14T10:10:00+00:00', 'down')
+        step(tmp, '2026-11-14T10:20:00+00:00', 'up', tg_down=True, expect=1)
+        check('отбой не ушёл: время оживления запомнено', 'up_since' in state(tmp))
+        step(tmp, '2026-11-14T15:00:00+00:00', 'down')
+        m = messages(tmp)
+        check('сайт упал снова: сначала дослан отбой прошлого сбоя с верным концом',
+              len(m) == 2 and 'сбой длился 20 мин (13:00 – 13:20)' in m[1]['text'])
+        check('новый сбой начат заново, с первой неудачи', state(tmp).get('suspect', '').startswith('2026-11-14T15:00')
+              and 'down_since' not in state(tmp))
+        step(tmp, '2026-11-14T15:10:00+00:00', 'down')
+        check('новая тревога считает длительность нового сбоя', 'Длится 10 мин.' in messages(tmp)[-1]['text'])
+
+
+def case_late_alert_then_reminder():
+    with tempfile.TemporaryDirectory() as tmp:
+        step(tmp, '2026-11-14T09:00:00+00:00', 'down')
+        for minute in ('10', '20', '30'):
+            step(tmp, f'2026-11-14T09:{minute}:00+00:00', 'down', tg_down=True, expect=1)
+        step(tmp, '2026-11-14T09:40:00+00:00', 'down')
+        step(tmp, '2026-11-14T12:30:00+00:00', 'down')
+        check('после досланной тревоги 3 часа тихо', len(messages(tmp)) == 1)
+        step(tmp, '2026-11-14T12:40:00+00:00', 'down')
+        m = messages(tmp)
+        check('напоминание через 3 часа после досланной тревоги', len(m) == 2 and 'длится 3 ч 40 мин' in m[1]['text'])
+
+
+def case_half_broken_state():
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, 'state.json'), 'w') as f:
+            json.dump({'alerted': '2026-11-14T08:00:00+00:00', 'last_alert': '2026-11-14T08:00:00+00:00'}, f)
+        step(tmp, '2026-11-14T09:00:00+00:00', 'down')
+        step(tmp, '2026-11-14T09:10:00+00:00', 'down')
+        check('повреждённая память: не падает и шлёт обычную тревогу', len(messages(tmp)) == 1)
 
 
 def case_broken():
@@ -147,7 +186,7 @@ def case_broken():
         step(tmp, '2026-11-14T09:10:00+00:00', 'broken')
         text = messages(tmp)[0]['text']
         check('сайт отвечает ошибкой: без номера ошибки и без подсказки про сеть',
-              'сайт на нём сломался' in text and 'пропала сеть' not in text and not any(c in text for c in ('500', '502', '503')))
+              'сайт отвечает ошибкой вместо страницы. Длится 10 мин.' in text and 'пропала сеть' not in text and not any(c in text for c in ('500', '502', '503')))
 
 
 def case_state_garbage():
@@ -197,13 +236,18 @@ def case_real_probe():
     with tempfile.TemporaryDirectory() as tmp:
         out = step(tmp, '2026-11-14T09:00:00+00:00', url='http://127.0.0.1:9/')
         check('соединение отклонено: сбой', 'check: fail' in out)
+    for bad in ('example.invalid/без-https', 'https://', 'htps://example.invalid/x', 'https://example.invalid/путь'):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = step(tmp, '2026-11-14T09:00:00+00:00', url=bad, expect=1)
+            check(f'кривой адрес в настройках ({bad[:8]}...): запуск красный, памяти не касается',
+                  'настройки' in out and not os.path.exists(os.path.join(tmp, 'state.json')))
+    with tempfile.TemporaryDirectory() as tmp:
         out = step(tmp, '2026-11-14T09:00:00+00:00', url='example.invalid/без-https', expect=1)
-        check('кривой адрес в настройках: запуск красный', 'настройки' in out)
         check('адрес сайта в журнал не печатается', 'example.invalid' not in out and '127.0.0.1' not in out)
 
 
 for case in (case_outage, case_blip, case_telegram_down, case_alert_never_delivered, case_drill, case_flap,
-             case_broken, case_state_garbage, case_keepalive, case_real_probe):
+             case_green_lost_then_down_again, case_late_alert_then_reminder, case_half_broken_state, case_broken, case_state_garbage, case_keepalive, case_real_probe):
     case()
 print('ИТОГ:', 'всё прошло' if not failed else f'упало {len(failed)}: ' + '; '.join(failed))
 sys.exit(1 if failed else 0)

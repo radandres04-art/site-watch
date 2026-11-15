@@ -33,7 +33,7 @@ KEEPALIVE = dt.timedelta(days=7)   # раз в неделю запись в ве
 MSK = dt.timezone(dt.timedelta(hours=3))
 
 SILENT = 'сайт не отвечает'  # только при этой причине уместна подсказка про пропавшую сеть
-BROKEN = 'сайт открывается с ошибкой: сервер на связи, но сайт на нём сломался'
+BROKEN = 'сайт отвечает ошибкой вместо страницы'
 
 
 class Config(Exception):
@@ -76,10 +76,7 @@ def probe_once(url):
     fake = os.environ.get('WATCH_FAKE_PROBE')
     if fake:
         return (True, '') if fake == 'up' else (False, {'down': SILENT, 'broken': BROKEN}.get(fake, SILENT))
-    try:
-        request = urllib.request.Request(url, headers={'User-Agent': 'site-watch'})
-    except ValueError:
-        raise Config('адрес сайта в настройках записан неверно')
+    request = urllib.request.Request(url, headers={'User-Agent': 'site-watch'})
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             code, body = response.status, response.read(2000).decode('utf-8', 'replace')
@@ -107,7 +104,19 @@ def probe_once(url):
     return False, BROKEN  # ошибка сервера, чужая страница вместо сайта, заглушка хостинга
 
 
+def check_url(url):
+    try:
+        parts = urllib.parse.urlparse(url)
+        good = parts.scheme in ('http', 'https') and bool(parts.hostname) and url.isascii() and ' ' not in url
+    except ValueError:
+        good = False
+    if not good:
+        raise Config('адрес сайта в настройках записан неверно')
+
+
 def probe(url):
+    if not os.environ.get('WATCH_FAKE_PROBE'):
+        check_url(url)
     reason = ''
     for attempt in range(ATTEMPTS):
         ok, reason = probe_once(url)
@@ -155,11 +164,11 @@ def texts(name, main, host):
     where = f'в {html.escape(main)} тревоги нет' if main else 'основной сторож молчит'
     look = f'\nПроверь сам: открой {html.escape(host)} с телефона.' if host else ''
 
-    def alert(reason, since, at, late):
-        lines = [f'<b>🔴 {name}: сайт не открывается</b>',
+    def alert(reason, since, at, late, again=False):
+        lines = [f'<b>🔴 {name}: сайт {"снова " if again else ""}не открывается</b>',
                  f'Запасной сторож: {reason}. Длится {span(since, at)}.']
         if reason == SILENT:
-            lines.append(f'Если {where}, скорее всего у сервера пропала сеть: сам он сообщить не может.')
+            lines.append(f'Если {where}, скорее всего у сервера пропала сеть: оттуда сообщение не отправить.')
         text = '\n'.join(lines) + look + f'\nРазбор: скажи Claude «разбери сбой сайта {name}».'
         return text + (f'\n<i>Пришло с опозданием: сбой с {moment(since, at)}.</i>' if late else '')
 
@@ -169,14 +178,15 @@ def texts(name, main, host):
 
     def green(since, at):
         return (f'<b>🟢 {name}: сайт снова открывается</b>\n'
-                f'Сбой длился {span(since, at)} ({moment(since, at)} – {moment(at, since)}).')
+                f'Запасной сторож: сбой длился {span(since, at)} ({moment(since, at)} – {moment(at, since)}).')
 
     def drill(ok, reason):
-        state = 'Сайт сейчас открывается.' if ok else f'Сайт сейчас НЕ открывается: {reason}.'
+        state = 'Сайт сейчас открывается.' if ok else f'Сейчас {reason}.'
         other = f'не в {html.escape(main)}' if main else 'отдельно от основного сторожа'
         silent = f'{html.escape(main)} замолчит' if main else 'основной сторож замолчит'
         return (f'<b>🧪 Проба запасного сторожа: он работает</b>\n{state}\n'
-                f'Я живу не на сервере сайта и пишу сюда, {other}: если у сервера пропадёт сеть, {silent}, а я нет.\n'
+                f'Запасной сторож живёт не на сервере сайта и пишет сюда, {other}: '
+                f'если у сервера пропадёт сеть, {silent}, а запасной нет.\n'
                 f'Настоящая тревога начнётся со слов «🔴 {name}: сайт не открывается».')
 
     return alert, remind, green, drill
@@ -191,15 +201,33 @@ def run(state, at, url, name, main):
     suspect, down = parse(state.get('suspect')), parse(state.get('down_since'))
     alerted = parse(state.get('alerted'))
     changed = failed = False
+    forget = ('suspect', 'down_since', 'alerted', 'last_alert', 'up_since')
+
+    if alerted and not down:  # память повреждена руками: начинаем с чистого листа
+        for key in forget:
+            state.pop(key, None)
+        suspect = alerted = None
+        changed = True
+    up = parse(state.get('up_since'))
+    if up and down:  # сайт уже оживал, но отбой тогда не ушёл: сначала досылаем его, прошлый сбой закрыт
+        if send(green(down, up), night(at)):
+            for key in forget:
+                state.pop(key, None)
+            state['last_recovery'] = up.isoformat()
+            suspect = down = alerted = None
+            changed = True
+        else:
+            return changed, True
 
     if ok:
         if down and alerted:
             if send(green(down, at), night(at)):
                 state.update(last_recovery=at.isoformat())
             else:
-                failed = True
+                state['up_since'] = at.isoformat()
+                changed = failed = True
         if not failed and (down or suspect):  # тревога до человека не дошла: отбой не шлём, просто забываем
-            for key in ('suspect', 'down_since', 'alerted', 'last_alert'):
+            for key in forget:
                 state.pop(key, None)
             changed = True
     elif not suspect and not down:
@@ -211,7 +239,7 @@ def run(state, at, url, name, main):
         state.pop('suspect', None)
         recovered = parse(state.get('last_recovery'))
         flapping = recovered is not None and since - recovered < FLAP
-        if send(alert(reason, since, at, late=down is not None), flapping and night(at)):
+        if send(alert(reason, since, at, late=down is not None, again=flapping), flapping and night(at)):
             state['alerted'] = state['last_alert'] = at.isoformat()
         else:
             failed = True
